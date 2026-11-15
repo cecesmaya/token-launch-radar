@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Launch Radar — pre-token protocols ranked by implied value</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div>
+    <h1>Token Launch Radar</h1>
+    <p class="sub">Which pre-token protocol is worth farming next, and what do I do about it.</p>
+  </div>
+  <div class="stats" id="stats"></div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button data-view="board" class="active">Board</button>
+  <button data-view="live">Live tokens</button>
+  <button data-view="model">Model</button>
+</nav>
+
+<section class="controls" id="controls">
+  <input id="q" type="search" placeholder="Search a protocol…" autocomplete="off">
+  <select id="cat" title="Category"><option value="">All categories</option></select>
+  <select id="chain" title="Chain"><option value="">All chains</option></select>
+  <select id="minTvl" title="Minimum TVL">
+    <option value="0">Any TVL</option>
+    <option value="50000000">TVL $50M+</option>
+    <option value="100000000">TVL $100M+</option>
+    <option value="500000000">TVL $500M+</option>
+    <option value="1000000000">TVL $1B+</option>
+  </select>
+  <label class="chk"><input id="gainers" type="checkbox"> Gainers only</label>
+  <select id="sort" title="Sort by">
+    <option value="implied">Sort: implied value</option>
+    <option value="tvl">Sort: TVL</option>
+    <option value="growth">Sort: 7d growth</option>
+    <option value="age">Sort: oldest first</option>
+  </select>
+  <button id="reset" type="button">Reset</button>
+</section>
+
+<main>
+  <section id="view-board">
+    <p class="hint" id="count"></p>
+    <table id="board">
+      <thead><tr>
+        <th>#</th><th>Protocol</th><th>Category</th><th>Chains</th>
+        <th class="num">TVL</th><th class="num">7d</th><th class="num">Age</th><th class="num">Implied value</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+
+  <section id="view-detail" hidden>
+    <button id="back" type="button">← Back to the board</button>
+    <div id="detail"></div>
+  </section>
+
+  <section id="view-live" hidden>
+    <p class="hint">These protocols already trade. Their market cap is the market's own value, not a
+    model's — they are here so you can see what the board's multiples are measured against.</p>
+    <table id="liveTable">
+      <thead><tr>
+        <th>Protocol</th><th>Category</th><th>Chains</th>
+        <th class="num">TVL</th><th class="num">Market cap</th><th class="num">7d</th>
+      </tr></thead>
+      <tbody id="liveRows"></tbody>
+    </table>
+  </section>
+
+  <section id="view-model" hidden>
+    <div id="modelDoc"></div>
+    <h2>Model sandbox</h2>
+    <p class="hint">Change the constants and the board re-ranks in front of you. The submitted
+    board.json is the one the model's stated constants produce; the sandbox is for asking
+    “what if”.</p>
+    <div class="sandbox">
+      <label>Growth weight <output id="gwOut"></output>
+        <input id="gw" type="range" min="0" max="1" step="0.05" value="0.5"></label>
+      <label>Maturity floor <output id="mfOut"></output>
+        <input id="mf" type="range" min="0.4" max="0.9" step="0.05" value="0.6"></label>
+      <label>Multiple cap <output id="capOut"></output>
+        <input id="cap" type="range" min="0.5" max="3" step="0.1" value="2"></label>
+    </div>
+    <h2>Category multiples</h2>
+    <p class="hint">The median market-cap / TVL of the live-token protocols in each category.
+    A category with fewer than 3 live comparables falls back to the global median.</p>
+    <table id="compTable">
+      <thead><tr><th>Category</th><th class="num">Live comparables</th><th class="num">Multiple</th></tr></thead>
+      <tbody id="compRows"></tbody>
+    </table>
+  </section>
+</main>
+
+<footer>
+  <p><strong>How to read this board.</strong> A protocol “records no token” when DefiLlama's
+  record carries no market cap, no CoinGecko id and no symbol for it. That is DefiLlama's record,
+  not proof: a protocol on this board may still have a token its record does not carry. Nothing
+  here predicts whether or when a token is issued, and an implied value is this radar's own
+  claim, never make.fun's. Farm only money you can afford to lose, and never pay anyone to claim
+  an airdrop — a real claim costs no fee beyond gas.</p>
+  <p id="src"></p>
+</footer>
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
