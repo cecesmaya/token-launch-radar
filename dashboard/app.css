@@ -44,6 +44,10 @@ tbody tr:hover { background: var(--panel); }
 .tag { display: inline-block; background: var(--panel2); border: 1px solid var(--line);
   border-radius: 4px; padding: 1px 7px; font-size: 12px; color: var(--muted); margin-right: 4px; }
 .watch { color: var(--amber); font-size: 11px; font-weight: 700; margin-left: 6px; }
+.verdict { font-size: 11px; font-weight: 700; margin-left: 6px; border-radius: 4px; padding: 1px 7px; }
+.verdict-farm { color: #0d1117; background: var(--green); }
+.verdict-thin { color: #0d1117; background: var(--amber); }
+.verdict-skip { color: var(--muted); background: var(--panel2); border: 1px solid var(--line); }
 #back { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
   border-radius: 6px; padding: 7px 12px; font: inherit; cursor: pointer; margin: 12px 0; }
 .detail h2 { margin-top: 4px; }

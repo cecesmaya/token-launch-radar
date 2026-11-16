@@ -15,15 +15,27 @@
 //                        live-token protocols (0.241 on this snapshot). A DEX's token trades at a
 //                        different multiple of its TVL than a lending protocol's, so the multiple
 //                        a row gets depends on what its own category's tokens actually trade at.
-//   base               = tvl_usd x category multiple
+//   size curve         = the log-log fit of market cap on TVL over all the live-token
+//                        protocols: predicted base = exp(a) x TVL^b. One fit, not one per
+//                        category: a category's own fit stands on 10 to 15 protocols and its
+//                        slope runs past 1.5, so a large protocol in that category is priced off
+//                        an extrapolation of eleven points. The curve is the median's rival, not
+//                        its replacement: both are fitted on a training half of the live set and
+//                        tested blind on the held-out half (see validateModel), and the board uses
+//                        the one whose held-out error is smaller. The validation is the model's
+//                        evidence, and the dashboard's Model view shows it in full: the splits,
+//                        the errors, and the naive global-median baseline both candidates have to
+//                        beat.
+//   base               = tvl_usd x category multiple (median) or the curve's predicted base
 //   growth             = clamp(change_7d, -60, 120) per cent
 //   growthMult         = 1 + (growth / 100) x GROWTH_WEIGHT
 //   maturity           = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
 //   implied            = max(1, round(base x growthMult x maturity))
 //
 // The three drivers are the ones the bounty names: the protocol's TVL, its seven-day growth, and
-// how long it has run with no token recorded. The category multiple is itself a snapshot figure:
-// the market's own pricing of the same kind of protocol, read off the live set.
+// how long it has run with no token recorded. The category multiple and the size curve are
+// themselves snapshot figures: the market's own pricing of the same kind of protocol, read off
+// the live set — and, unlike a bare assertion, tested blind before the board is built.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -76,7 +88,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -105,6 +117,7 @@ export interface BoardRow {
   age_days: number | null;
   implied_value_usd: number;
   model: {
+    predictor: 'median' | 'curve';
     category_multiple: number;
     comparables: number;
     growth_pct: number;
@@ -112,6 +125,8 @@ export interface BoardRow {
     maturity_multiplier: number;
     age_days: number | null;
   };
+  farm_verdict: 'FARM' | 'THIN' | 'SKIP';
+  farm_gas_usd: number;
   farm_steps: string[];
 }
 
@@ -132,6 +147,8 @@ export interface RadarRow {
   comparables: number;
   growth_multiplier: number;
   maturity_multiplier: number;
+  farm_verdict: 'FARM' | 'THIN' | 'SKIP';
+  farm_gas_usd: number;
   farm_steps: string[];
 }
 
@@ -162,11 +179,15 @@ export interface RadarData {
   floor_usd: number;
   model: ModelConstants;
   model_version: string;
+  predictor: 'median' | 'curve';
+  validation: ValidationReport;
   watchlist_size: number;
   board_size: number;
   early_size: number;
   live_size: number;
   global_multiple: number;
+  curve_fit: { a: number; b: number; n: number } | null;
+  verdict_counts: { FARM: number; THIN: number; SKIP: number };
   watchlist: string[];
   comparables: CategoryComparable[];
   rows: RadarRow[];
@@ -255,12 +276,243 @@ export function multipleFor(
   return { multiple: global, comparables: 0, fallback: true };
 }
 
+/** The live-token protocols the model learns from: a market cap, a positive TVL, not an exchange. */
+export function liveSet(snapshot: Snapshot): SnapshotProtocol[] {
+  return snapshot.protocols.filter(
+    (p) => p.mcap_usd !== null && p.gecko_id !== null && p.symbol !== null && p.category !== 'CEX' && p.tvl_usd > 0 && p.mcap_usd! > 0,
+  );
+}
+
+/** One log-log fit of market cap on TVL: ln(mcap) = a + b x ln(tvl), over n protocols. */
+export interface CurveFit {
+  a: number;
+  b: number;
+  n: number;
+}
+
+/** Least squares on the logs; null when fewer than two points stand. */
+function fitCurveFit(points: { tvl: number; mcap: number }[]): CurveFit | null {
+  const n = points.length;
+  if (n < 2) return null;
+  let sx = 0;
+  let sy = 0;
+  let sxx = 0;
+  let sxy = 0;
+  for (const p of points) {
+    const x = Math.log(p.tvl);
+    const y = Math.log(p.mcap);
+    sx += x;
+    sy += y;
+    sxx += x * x;
+    sxy += x * y;
+  }
+  const denom = n * sxx - sx * sx;
+  if (denom === 0) return null;
+  const b = (n * sxy - sx * sy) / denom;
+  const a = (sy - b * sx) / n;
+  return { a, b, n };
+}
+
+/** A predictor: how a protocol's base value is read off the live set. */
+export type Predictor =
+  | {
+      kind: 'median';
+      multiples: { byCategory: Map<string, { multiple: number; count: number; fallback: boolean }>; global: number };
+    }
+  | {
+      kind: 'curve';
+      global: CurveFit;
+    };
+
+/** Fit one predictor on a training set of live-token protocols. */
+export function fitPredictor(kind: 'median' | 'curve', train: SnapshotProtocol[], model: ModelConstants, snapshot: Snapshot): Predictor {
+  if (kind === 'median') {
+    return { kind: 'median', multiples: categoryMultiples({ ...snapshot, protocols: train }, model) };
+  }
+  const global = fitCurveFit(train.map((p) => ({ tvl: p.tvl_usd, mcap: p.mcap_usd! })));
+  if (global === null) throw new SnapshotError('too few live-token protocols to fit a size curve');
+  return { kind: 'curve', global };
+}
+
+/** The base value one protocol gets under a predictor, its effective multiple, and how many live protocols the fit behind it stands on. */
+export function predictBase(
+  protocol: SnapshotProtocol,
+  predictor: Predictor,
+  model: ModelConstants,
+): { base: number; effectiveMultiple: number; comparables: number; fallback: boolean } {
+  if (predictor.kind === 'median') {
+    const { multiple, comparables, fallback } = multipleFor(protocol, predictor.multiples, model);
+    return { base: protocol.tvl_usd * multiple, effectiveMultiple: multiple, comparables, fallback };
+  }
+  const base = Math.exp(predictor.global.a) * Math.pow(protocol.tvl_usd, predictor.global.b);
+  return { base, effectiveMultiple: base / protocol.tvl_usd, comparables: predictor.global.n, fallback: false };
+}
+
+/** Pearson's r between two equal-length lists, or null when it cannot be read. */
+function pearson(xs: number[], ys: number[]): number | null {
+  const n = xs.length;
+  if (n < 2) return null;
+  let mx = 0;
+  let my = 0;
+  for (let i = 0; i < n; i++) {
+    mx += xs[i]!;
+    my += ys[i]!;
+  }
+  mx /= n;
+  my /= n;
+  let sxy = 0;
+  let sxx = 0;
+  let syy = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i]! - mx;
+    const dy = ys[i]! - my;
+    sxy += dx * dy;
+    sxx += dx * dx;
+    syy += dy * dy;
+  }
+  if (sxx === 0 || syy === 0) return null;
+  return sxy / Math.sqrt(sxx * syy);
+}
+
+const round3 = (n: number): number => Math.round(n * 1000) / 1000;
+
+/** One candidate's held-out error on one split. */
+export interface SplitCandidate {
+  name: 'median' | 'curve' | 'baseline';
+  med_abs_log_err: number;
+  med_rel_err: number;
+  within_2x: number;
+  pearson_log: number | null;
+}
+
+/** One split's held-out results: who trained on what, and how each candidate did on the rest. */
+export interface SplitResult {
+  split: 'holdout' | 'time';
+  train: number;
+  test: number;
+  candidates: SplitCandidate[];
+}
+
+/** The validation report: the splits, the candidates' held-out errors, and the predictor the board uses. */
+export interface ValidationReport {
+  predictor: 'median' | 'curve';
+  reason: string;
+  pooled: { name: 'median' | 'curve' | 'baseline'; med_abs_log_err: number }[];
+  splits: SplitResult[];
+}
+
+/**
+ * The model's blind test, run before the board is built. The live-token protocols are split two
+ * ways — a holdout (every fifth protocol by slug, so the split is fixed by the snapshot, never by
+ * chance) and a time split (the older half trains, the younger half is tested, because pricing a
+ * young protocol off older ones is the board's own task) — and each candidate is fitted on the
+ * training half only and scored on the held-out half, where its predicted market cap meets the
+ * market's own. The naive baseline is the global median multiple fitted on the same training
+ * half: a candidate that cannot beat it has learned nothing. The winner is the smaller pooled
+ * median absolute log error over both held-out sets, the time split breaking a near-tie (within
+ * 0.01); the board then refits the winner on every live protocol, and the numbers below stay
+ * the train-only evidence for it, never a claim about the refit. The errors are large — the
+ * typical prediction lands within about three times the market's own value — and the report
+ * says so instead of hiding it: market-cap / TVL varies enormously across protocols, and the
+ * board is a ranking, not a price.
+ */
+export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL): ValidationReport {
+  const live = liveSet(snapshot);
+  const sorted = [...live].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const holdoutTrain = sorted.filter((_, i) => i % 5 !== 4);
+  const holdoutTest = sorted.filter((_, i) => i % 5 === 4);
+  const dated = live.filter((p) => p.listed_at !== null).sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : 0));
+  const mid = Math.floor(dated.length / 2);
+  const timeTrain = dated.slice(0, mid);
+  const timeTest = dated.slice(mid);
+
+  const score = (kind: 'median' | 'curve' | 'baseline', train: SnapshotProtocol[], test: SnapshotProtocol[]): { candidate: SplitCandidate; logErrs: number[] } => {
+    let predictor: Predictor;
+    if (kind === 'baseline') {
+      const multiples = categoryMultiples({ ...snapshot, protocols: train }, model);
+      predictor = { kind: 'median', multiples: { byCategory: new Map(), global: multiples.global } };
+    } else {
+      predictor = fitPredictor(kind, train, model, snapshot);
+    }
+    const logErrs: number[] = [];
+    const relErrs: number[] = [];
+    const logPred: number[] = [];
+    const logActual: number[] = [];
+    let within = 0;
+    for (const p of test) {
+      const { base } = predictBase(p, predictor, model);
+      const v = impliedFromBase(p, snapshot.as_of, model, base);
+      const ratio = v / p.mcap_usd!;
+      logErrs.push(Math.abs(Math.log(ratio)));
+      relErrs.push(Math.abs(ratio - 1));
+      if (ratio >= 0.5 && ratio <= 2) within++;
+      logPred.push(Math.log(v));
+      logActual.push(Math.log(p.mcap_usd!));
+    }
+    return {
+      candidate: {
+        name: kind,
+        med_abs_log_err: round3(median(logErrs, NaN)),
+        med_rel_err: round3(median(relErrs, NaN)),
+        within_2x: test.length === 0 ? 0 : round3(within / test.length),
+        pearson_log: pearson(logPred, logActual) === null ? null : round3(pearson(logPred, logActual)!),
+      },
+      logErrs,
+    };
+  };
+
+  const defs = ([
+    ['holdout', holdoutTrain, holdoutTest],
+    ['time', timeTrain, timeTest],
+  ] as const).map(([split, train, test]) => ({ split, train, test }));
+  const pooledErrs = new Map<string, number[]>();
+  const splits: SplitResult[] = defs.map(({ split, train, test }) => ({
+    split,
+    train: train.length,
+    test: test.length,
+    candidates: (['median', 'curve', 'baseline'] as const).map((kind) => {
+      const { candidate, logErrs } = score(kind, train, test);
+      pooledErrs.set(kind, [...(pooledErrs.get(kind) ?? []), ...logErrs]);
+      return candidate;
+    }),
+  }));
+  const pooled = (['median', 'curve', 'baseline'] as const).map((name) => ({
+    name,
+    med_abs_log_err: round3(median(pooledErrs.get(name) ?? [], NaN)),
+  }));
+  const pooledErr = (name: string): number => pooled.find((p) => p.name === name)!.med_abs_log_err;
+  const time = splits[1]!;
+  const timeErr = (name: string): number => time.candidates.find((c) => c.name === name)!.med_abs_log_err;
+  let predictor: 'median' | 'curve' = pooledErr('curve') < pooledErr('median') ? 'curve' : 'median';
+  if (Math.abs(pooledErr('curve') - pooledErr('median')) <= 0.01) {
+    predictor = timeErr('curve') < timeErr('median') ? 'curve' : 'median';
+  }
+  const reason =
+    predictor === 'curve'
+      ? `the size curve's pooled held-out error beats the category median's (${pooledErr('curve')} vs ${pooledErr('median')} median |log error| over both held-out sets), so the board prices off the fitted curve`
+      : `the category median's pooled held-out error beats the size curve's (${pooledErr('median')} vs ${pooledErr('curve')} median |log error| over both held-out sets), so the board prices off the category medians`;
+  return { predictor, reason, pooled, splits };
+}
+
+/** The growth and maturity multipliers and the implied value of a base, shared by every predictor. */
+export function impliedFromBase(protocol: SnapshotProtocol, asOf: string, model: ModelConstants, base: number): number {
+  const age = ageDays(asOf, protocol.listed_at);
+  const rawGrowth = finite(protocol.change_7d, 0);
+  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
+  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
+  const ageForModel = age ?? model.unknown_age_days;
+  const maturityMult =
+    model.maturity_floor +
+    (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
+  return Math.max(1, Math.round(base * growthMult * maturityMult));
+}
+
 /** The three multipliers and the implied value one protocol gets under `model`. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
-  multiples: { byCategory: Map<string, { multiple: number; count: number; fallback: boolean }>; global: number },
+  predictor: Predictor,
 ): {
   implied: number;
   categoryMultiple: number;
@@ -279,10 +531,9 @@ export function impliedValue(
   const maturityMult =
     model.maturity_floor +
     (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const { multiple, comparables, fallback } = multipleFor(protocol, multiples, model);
-  const base = protocol.tvl_usd * multiple;
+  const { base, effectiveMultiple, comparables, fallback } = predictBase(protocol, predictor, model);
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
-  return { implied, categoryMultiple: multiple, comparables, fallback, growthPct, growthMult, maturityMult, age };
+  return { implied, categoryMultiple: effectiveMultiple, comparables, fallback, growthPct, growthMult, maturityMult, age };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -329,9 +580,10 @@ export interface BoardSummary {
   live_size: number;
 }
 
-/** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const multiples = categoryMultiples(snapshot, model);
+/** The protocols the board ranks, strongest first, with ranks 1..n, and the validation behind it. */
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; validation: ValidationReport; predictor: Predictor } {
+  const validation = validateModel(snapshot, model);
+  const predictor = fitPredictor(validation.predictor, liveSet(snapshot), model, snapshot);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but
@@ -347,38 +599,48 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   }
 
   const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, model, multiples);
+    const v = impliedValue(p, snapshot.as_of, model, predictor);
     return { p, v };
   });
   scored.sort((a, b) => b.v.implied - a.v.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  return scored.map((s, i) => ({
-    rank: i + 1,
-    slug: s.p.slug,
-    name: s.p.name,
-    category: s.p.category,
-    chains: s.p.chains,
-    tvl_usd: s.p.tvl_usd,
-    change_7d: s.p.change_7d,
-    mcap_usd: s.p.mcap_usd,
-    listed_at: s.p.listed_at,
-    gecko_id: s.p.gecko_id,
-    symbol: s.p.symbol,
-    token_status: 'pre-token',
-    age_days: s.v.age,
-    implied_value_usd: s.v.implied,
-    model: {
-      category_multiple: round4(s.v.categoryMultiple),
-      comparables: s.v.comparables,
-      growth_pct: s.v.growthPct,
-      growth_multiplier: round4(s.v.growthMult),
-      maturity_multiplier: round4(s.v.maturityMult),
+  const board = scored.map((s, i) => {
+    const econ = farmEconomics(s.p, s.v.age, s.v.implied);
+    return {
+      rank: i + 1,
+      slug: s.p.slug,
+      name: s.p.name,
+      category: s.p.category,
+      chains: s.p.chains,
+      tvl_usd: s.p.tvl_usd,
+      change_7d: s.p.change_7d,
+      mcap_usd: s.p.mcap_usd,
+      listed_at: s.p.listed_at,
+      gecko_id: s.p.gecko_id,
+      symbol: s.p.symbol,
+      token_status: 'pre-token' as const,
       age_days: s.v.age,
-    },
-    farm_steps: farmSteps(s.p, s.v.age).map(stepText),
-  }));
+      implied_value_usd: s.v.implied,
+      model: {
+        predictor: validation.predictor,
+        category_multiple: round6(s.v.categoryMultiple),
+        comparables: s.v.comparables,
+        growth_pct: s.v.growthPct,
+        growth_multiplier: round4(s.v.growthMult),
+        maturity_multiplier: round4(s.v.maturityMult),
+        age_days: s.v.age,
+      },
+      farm_verdict: econ.verdict,
+      farm_gas_usd: econ.gasUsd,
+      farm_steps: farmSteps(s.p, s.v.age, s.v.implied, econ).map(stepText),
+    };
+  });
+  return { board, validation, predictor };
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
+
+/** Six decimals: the board's stored multiple, so the dashboard's sandbox re-ranks to the same dollar the board states. */
+const round6 = (n: number): number => Math.round(n * 1e6) / 1e6;
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 characters. */
 export function stepText(step: FarmStep): string {
@@ -433,18 +695,57 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
   return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
 }
 
+/** $2.75B, $456.7M, $12.3K, $842 — the short dollar figure a farm step quotes. */
+function fmtUsdShort(n: number): string {
+  if (n >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return '$' + (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return '$' + (n / 1e3).toFixed(1) + 'K';
+  return '$' + Math.round(n);
+}
+
+/** What farming one protocol costs, and the verdict on whether it is worth it. */
+export interface FarmEconomics {
+  gasUsd: number;
+  capitalUsd: number;
+  holdDays: number;
+  verdict: 'FARM' | 'THIN' | 'SKIP';
+}
+
 /**
- * A protocol's farm plan: six steps, each an action with a cost and a time. The plan is derived
- * from the protocol's own record (category, chains, TVL, age), never from a hand-written list of
- * names. Nothing here promises a token: the protocol records no token, and the plan farms the
- * protocol as it is, so the position is worth holding even if no launch ever comes.
+ * A farm plan's economics, from the protocol's own record. The gas is the plan's own steps added
+ * up: the first transactions, one qualifying action a week at about $2 of gas, and the claim. The
+ * verdict compares the protocol's implied value with that gas: FARM when the implied value is at
+ * least a million times the gas the plan spends, THIN at a hundred thousand times, SKIP below.
+ * The verdict is a size test, never a promise — it says the gas is trivial next to the protocol,
+ * not that any airdrop pays it back.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
-  const chain = chainOf(p);
+export function farmEconomics(p: SnapshotProtocol, age: number | null, implied: number): FarmEconomics {
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
+  const gasUsd = 3 + (capital >= 150 ? 8 : 4) + 2 * Math.ceil(hold / 7) + 2;
+  const ratio = implied / gasUsd;
+  const verdict = ratio >= 1_000_000 ? 'FARM' : ratio >= 100_000 ? 'THIN' : 'SKIP';
+  return { gasUsd, capitalUsd: capital, holdDays: hold, verdict };
+}
+
+/**
+ * A protocol's farm plan: seven steps, the first the verdict with the plan's net cost, then six
+ * concrete actions each with a cost and a time. The plan is derived from the protocol's own
+ * record (category, chains, TVL, age, implied value), never from a hand-written list of names.
+ * Nothing here promises a token: the protocol records no token, and the plan farms the protocol
+ * as it is, so the position is worth holding even if no launch ever comes.
+ */
+export function farmSteps(p: SnapshotProtocol, age: number | null, implied: number, econ: FarmEconomics): FarmStep[] {
+  const chain = chainOf(p);
+  const capital = econ.capitalUsd;
+  const hold = econ.holdDays;
   const action = actionFor(p, capital, chain);
   return [
+    {
+      text: `Verdict: ${econ.verdict} — this protocol's implied value is ${fmtUsdShort(implied)} against about $${econ.gasUsd} of gas over ${hold} days on $${capital} of capital.`,
+      cost: `about $${econ.gasUsd} of gas in all`,
+      time: `${hold} days`,
+    },
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
       cost: 'under $3 of gas for the first transaction',
@@ -514,16 +815,20 @@ export function radarRow(row: BoardRow): RadarRow {
     comparables: row.model.comparables,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
+    farm_verdict: row.farm_verdict,
+    farm_gas_usd: row.farm_gas_usd,
     farm_steps: row.farm_steps,
   };
 }
 
 /** Everything the dashboard renders, from the snapshot. */
-export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const board = buildBoard(snapshot, model);
+export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData; validation: ValidationReport } {
+  const { board, validation, predictor } = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const multiples = categoryMultiples(snapshot, model);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const verdict_counts = { FARM: 0, THIN: 0, SKIP: 0 };
+  for (const r of board) verdict_counts[r.farm_verdict]++;
   const comparables: CategoryComparable[] = [...multiples.byCategory.entries()]
     .map(([category, v]) => ({ category, count: v.count, multiple: round4(v.multiple), fallback: false }))
     .sort((a, b) => b.count - a.count || (a.category < b.category ? -1 : 1));
@@ -533,17 +838,21 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     floor_usd: snapshot.floor_usd,
     model,
     model_version: MODEL_VERSION,
+    predictor: validation.predictor,
+    validation,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     early_size: early,
     live_size: live.length,
     global_multiple: round4(multiples.global),
+    curve_fit: predictor.kind === 'curve' ? { a: round4(predictor.global.a), b: round4(predictor.global.b), n: predictor.global.n } : null,
+    verdict_counts,
     watchlist: [...snapshot.watchlist],
     comparables,
     rows: board.map(radarRow),
     live,
   };
-  return { board, radar };
+  return { board, radar, validation };
 }
 
 /** The snapshot out of a file's text, refused unless it is the shape the model scores. */

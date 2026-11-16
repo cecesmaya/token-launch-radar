@@ -43,7 +43,7 @@ function sandboxImplied(row, sb) {
 }
 
 const state = {
-  view: 'board', q: '', cat: '', chain: '', minTvl: 0, gainers: false,
+  view: 'board', q: '', cat: '', chain: '', minTvl: 0, gainers: false, verdict: '',
   sort: 'implied', detail: null, sb: { gw: 0.5, mf: 0.6, cap: 2.0 },
 };
 
@@ -56,6 +56,7 @@ function visibleRows() {
     if (state.chain && !r.chains.includes(state.chain)) return false;
     if (r.tvl_usd < state.minTvl) return false;
     if (state.gainers && !(r.change_7d !== null && r.change_7d > 0)) return false;
+    if (state.verdict && r.farm_verdict !== state.verdict) return false;
     return true;
   });
   const sb = state.sb;
@@ -76,9 +77,11 @@ function renderBoard() {
     R.watchlist_size + ' on the watchlist, ' + R.early_size + ' found early below the floor.';
   $('rows').innerHTML = scored.map(({ r, v }) => {
     const cls = r.change_7d === null ? '' : r.change_7d > 0 ? 'pos' : r.change_7d < 0 ? 'neg' : '';
+    const vcls = r.farm_verdict === 'FARM' ? 'verdict-farm' : r.farm_verdict === 'THIN' ? 'verdict-thin' : 'verdict-skip';
     return '<tr data-slug="' + esc(r.slug) + '"><td class="rank">' + r.rank + '</td>' +
       '<td><span class="name">' + esc(r.name) + '</span>' +
-      (WATCH.has(r.slug) ? '<span class="watch">WATCHLIST</span>' : '') + '</td>' +
+      (WATCH.has(r.slug) ? '<span class="watch">WATCHLIST</span>' : '') +
+      '<span class="verdict ' + vcls + '">' + r.farm_verdict + '</span></td>' +
       '<td>' + esc(r.category ?? '—') + '</td>' +
       '<td>' + r.chains.slice(0, 3).map((c) => '<span class="tag">' + esc(c) + '</span>').join('') +
       (r.chains.length > 3 ? '<span class="tag">+' + (r.chains.length - 3) + '</span>' : '') + '</td>' +
@@ -94,8 +97,10 @@ function renderDetail() {
   if (!r) { showView('board'); return; }
   const math = 'implied = TVL × category multiple × growth × maturity\n' +
     fmtUsd(r.tvl_usd) + ' × ' + r.category_multiple.toFixed(3) +
-    (r.comparables > 0 ? '  (' + r.comparables + ' live comparables in ' + (r.category ?? 'this category') + ')'
-      : '  (global median — fewer than 3 live comparables in ' + (r.category ?? 'this category') + ')') +
+    (R.predictor === 'curve'
+      ? '  (size curve over ' + r.comparables + ' live protocols)'
+      : (r.comparables > 0 ? '  (' + r.comparables + ' live comparables in ' + (r.category ?? 'this category') + ')'
+        : '  (global median — fewer than 3 live comparables in ' + (r.category ?? 'this category') + ')')) +
     '\n× ' + r.growth_multiplier.toFixed(4) + ' growth × ' + r.maturity_multiplier.toFixed(4) +
     ' maturity = ' + fmtUsd(r.implied_value_usd);
   $('detail').innerHTML =
@@ -110,10 +115,18 @@ function renderDetail() {
     '<div><b>' + fmtUsd(r.implied_value_usd) + '</b><span>Implied value if it launched today</span></div>' +
     '</div>' +
     '<h2>Why this value</h2><div class="math">' + esc(math) + '</div>' +
-    '<p class="hint">The multiple is the median market-cap / TVL of the live-token protocols in ' +
-    esc(r.category ?? 'its category') + '. A category with fewer than 3 live comparables falls back ' +
-    'to the global median of ' + R.global_multiple.toFixed(3) + '. The growth multiplier clamps the ' +
-    '7-day change to −60…+120% at half weight; maturity rises from 0.6 to 1.0 over three years tracked.</p>' +
+    (R.predictor === 'curve'
+      ? '<p class="hint">The multiple is the size curve’s effective multiple at this TVL: the curve ' +
+        'fits market cap on TVL over ' + R.curve_fit.n + ' live-token protocols ' +
+        '(ln mcap = ' + R.curve_fit.a.toFixed(2) + ' + ' + R.curve_fit.b.toFixed(2) + ' × ln TVL), so a ' +
+        'protocol’s multiple falls as its TVL grows — the market pays less per dollar of TVL at ' +
+        'size. The curve was chosen over the category medians by a blind test on held-out live ' +
+        'protocols; the Model tab shows the test. The growth multiplier clamps the 7-day change ' +
+        'to −60…+120% at half weight; maturity rises from 0.6 to 1.0 over three years tracked.</p>'
+      : '<p class="hint">The multiple is the median market-cap / TVL of the live-token protocols in ' +
+        esc(r.category ?? 'its category') + '. A category with fewer than 3 live comparables falls back ' +
+        'to the global median of ' + R.global_multiple.toFixed(3) + '. The growth multiplier clamps the ' +
+        '7-day change to −60…+120% at half weight; maturity rises from 0.6 to 1.0 over three years tracked.</p>') +
     '<h2>How to farm it</h2>' +
     '<ol class="steps">' + r.farm_steps.map((s) => {
       const i = s.indexOf(' Cost: ');
@@ -139,19 +152,54 @@ function renderLive() {
 }
 
 function renderModel() {
+  const V = R.validation;
+  const pooledRow = (p) => '<tr><td>' + esc(p.name) + '</td><td class="num">' + p.med_abs_log_err.toFixed(3) + '</td></tr>';
+  const splitRows = V.splits.map((s) => {
+    const c = (name) => s.candidates.find((x) => x.name === name);
+    return '<tr><td>' + esc(s.split) + ' (' + s.train + ' train, ' + s.test + ' test)</td>' +
+      '<td class="num">' + c('curve').med_abs_log_err.toFixed(3) + '</td>' +
+      '<td class="num">' + c('median').med_abs_log_err.toFixed(3) + '</td>' +
+      '<td class="num">' + c('baseline').med_abs_log_err.toFixed(3) + '</td></tr>';
+  }).join('');
+  const curveLine = R.predictor === 'curve' && R.curve_fit
+    ? '<p>The board prices off the <strong>size curve</strong>: ln(market cap) = ' +
+      R.curve_fit.a.toFixed(2) + ' + ' + R.curve_fit.b.toFixed(2) + ' × ln(TVL), fitted over ' +
+      R.curve_fit.n + ' live-token protocols. The slope is below 1, so market cap grows more ' +
+      'slowly than TVL: a protocol ten times as large is worth about three times as much, not ' +
+      'ten. A flat multiple would overprice the giants and underprice the small ones; the curve ' +
+      'is what the market’s own numbers say.</p>'
+    : '<p>The board prices off the <strong>category medians</strong>: each protocol’s multiple is ' +
+      'the median market-cap / TVL of the live-token protocols in its category.</p>';
   $('modelDoc').innerHTML =
     '<h2>The model, in one paragraph</h2>' +
     '<p>Every row is scored by the same function, from the snapshot’s own figures only. A ' +
-    'protocol’s base is its TVL times its category’s multiple — the median market-cap / TVL of ' +
-    'the live-token protocols in that category, at least 3 of them, clamped to 0.02…2.0, falling ' +
-    'back to the global median of ' + R.global_multiple.toFixed(3) + ' where a category is too thin. ' +
-    'Growth multiplies by 1 + the clamped 7-day change at half weight; maturity multiplies by ' +
-    '0.6 rising to 1.0 over three years tracked with no token. No protocol name is ever ' +
-    'special-cased: the same function scores every row, and the board re-ranks if the snapshot ' +
-    'moves. That is what makes the radar dynamic — run it on a fresh snapshot and it finds the ' +
-    'next launches early, without anyone hand-keeping a list.</p>' +
+    'protocol’s base is its TVL priced off the live-token set — the market’s own pricing of ' +
+    'protocols that already trade — then growth multiplies by 1 + the clamped 7-day change at ' +
+    'half weight, and maturity multiplies by 0.6 rising to 1.0 over three years tracked with no ' +
+    'token. No protocol name is ever special-cased: the same function scores every row, and the ' +
+    'board re-ranks if the snapshot moves. That is what makes the radar dynamic — run it on a ' +
+    'fresh snapshot and it finds the next launches early, without anyone hand-keeping a list.</p>' +
+    curveLine +
     '<p class="hint">Model ' + esc(R.model_version) + ' · snapshot ' + esc(R.as_of) + ' · ' +
-    R.board_size + ' rows · ' + R.watchlist_size + ' watchlist · ' + R.early_size + ' early.</p>';
+    R.board_size + ' rows · ' + R.watchlist_size + ' watchlist · ' + R.early_size + ' early · ' +
+    'verdicts ' + R.verdict_counts.FARM + ' FARM, ' + R.verdict_counts.THIN + ' THIN, ' +
+    R.verdict_counts.SKIP + ' SKIP.</p>' +
+    '<h2>Tested blind, before the board was built</h2>' +
+    '<p>' + esc(V.reason) + '. The test fits each candidate on a training half of the ' +
+    'live-token protocols only and scores it on the held-out half, where its predicted market cap ' +
+    'meets the market’s own. The holdout takes every fifth protocol by slug; the time split trains ' +
+    'on the older half and tests on the younger half, because pricing a young protocol off older ' +
+    'ones is the board’s own task. The baseline is the naive global median multiple on the same ' +
+    'training half — a candidate that cannot beat it has learned nothing. The board then refits ' +
+    'the winner on every live-token protocol; these numbers stay the train-only evidence for it.</p>' +
+    '<p class="hint">The errors are large, and the table says so: the typical prediction lands ' +
+    'within about three times the market’s own value (median |log error| near 1.15). Market-cap / ' +
+    'TVL varies enormously across protocols, and the board is a ranking, not a price — the order ' +
+    'is the claim, and the farm verdict is whether the gas is trivial next to the protocol.</p>' +
+    '<table><thead><tr><th>Candidate</th><th class="num">Pooled median |log error|</th></tr></thead><tbody>' +
+    V.pooled.map(pooledRow).join('') + '</tbody></table>' +
+    '<table><thead><tr><th>Split</th><th class="num">Curve</th><th class="num">Category median</th><th class="num">Baseline</th></tr></thead><tbody>' +
+    splitRows + '</tbody></table>';
   $('compRows').innerHTML = R.comparables.map((c) =>
     '<tr><td>' + esc(c.category) + '</td><td class="num">' + c.count + '</td>' +
     '<td class="num">' + c.multiple.toFixed(3) + '</td></tr>').join('') +
@@ -206,11 +254,12 @@ function init() {
   $('chain').addEventListener('change', (e) => { state.chain = e.target.value; renderBoard(); });
   $('minTvl').addEventListener('change', (e) => { state.minTvl = +e.target.value; renderBoard(); });
   $('gainers').addEventListener('change', (e) => { state.gainers = e.target.checked; renderBoard(); });
+  $('verdict').addEventListener('change', (e) => { state.verdict = e.target.value; renderBoard(); });
   $('sort').addEventListener('change', (e) => { state.sort = e.target.value; renderBoard(); });
   $('reset').addEventListener('click', () => {
-    Object.assign(state, { q: '', cat: '', chain: '', minTvl: 0, gainers: false, sort: 'implied' });
+    Object.assign(state, { q: '', cat: '', chain: '', minTvl: 0, gainers: false, verdict: '', sort: 'implied' });
     $('q').value = ''; $('cat').value = ''; $('chain').value = '';
-    $('minTvl').value = '0'; $('gainers').checked = false; $('sort').value = 'implied';
+    $('minTvl').value = '0'; $('gainers').checked = false; $('verdict').value = ''; $('sort').value = 'implied';
     renderBoard();
   });
   $('rows').addEventListener('click', (e) => {

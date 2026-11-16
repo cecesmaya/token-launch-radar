@@ -33,6 +33,12 @@
     <option value="1000000000">TVL $1B+</option>
   </select>
   <label class="chk"><input id="gainers" type="checkbox"> Gainers only</label>
+  <select id="verdict" title="Farm verdict">
+    <option value="">Any verdict</option>
+    <option value="FARM">FARM only</option>
+    <option value="THIN">THIN only</option>
+    <option value="SKIP">SKIP only</option>
+  </select>
   <select id="sort" title="Sort by">
     <option value="implied">Sort: implied value</option>
     <option value="tvl">Sort: TVL</option>
@@ -85,9 +91,11 @@
       <label>Multiple cap <output id="capOut"></output>
         <input id="cap" type="range" min="0.5" max="3" step="0.1" value="2"></label>
     </div>
-    <h2>Category multiples</h2>
-    <p class="hint">The median market-cap / TVL of the live-token protocols in each category.
-    A category with fewer than 3 live comparables falls back to the global median.</p>
+    <h2>The rival: category multiples</h2>
+    <p class="hint">The median market-cap / TVL of the live-token protocols in each category — the
+    model the blind test ran against the size curve. A category with fewer than 3 live
+    comparables falls back to the global median. The curve won on the pooled held-out error,
+    so the board does not price off these multiples; they are here so you can see what lost.</p>
     <table id="compTable">
       <thead><tr><th>Category</th><th class="num">Live comparables</th><th class="num">Multiple</th></tr></thead>
       <tbody id="compRows"></tbody>
