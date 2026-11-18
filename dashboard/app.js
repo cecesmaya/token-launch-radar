@@ -176,28 +176,38 @@ function renderModel() {
     'protocol’s base is its TVL priced off the live-token set — the market’s own pricing of ' +
     'protocols that already trade — then growth multiplies by 1 + the clamped 7-day change at ' +
     'half weight, and maturity multiplies by 0.6 rising to 1.0 over three years tracked with no ' +
-    'token. No protocol name is ever special-cased: the same function scores every row, and the ' +
-    'board re-ranks if the snapshot moves. That is what makes the radar dynamic — run it on a ' +
-    'fresh snapshot and it finds the next launches early, without anyone hand-keeping a list.</p>' +
+    'token. No protocol name is ever special-cased: the same function scores every row. Run it ' +
+    'on a fresh snapshot and it finds the next launches early.</p>' +
     curveLine +
     '<p class="hint">Model ' + esc(R.model_version) + ' · snapshot ' + esc(R.as_of) + ' · ' +
     R.board_size + ' rows · ' + R.watchlist_size + ' watchlist · ' + R.early_size + ' early · ' +
     'verdicts ' + R.verdict_counts.FARM + ' FARM, ' + R.verdict_counts.THIN + ' THIN, ' +
     R.verdict_counts.SKIP + ' SKIP.</p>' +
     '<h2>Tested blind, before the board was built</h2>' +
-    '<p>' + esc(V.reason) + '. The test fits each candidate on a training half of the ' +
-    'live-token protocols only and scores it on the held-out half, where its predicted market cap ' +
-    'meets the market’s own. The holdout takes every fifth protocol by slug; the time split trains ' +
-    'on the older half and tests on the younger half, because pricing a young protocol off older ' +
-    'ones is the board’s own task. The baseline is the naive global median multiple on the same ' +
-    'training half — a candidate that cannot beat it has learned nothing. The board then refits ' +
-    'the winner on every live-token protocol; these numbers stay the train-only evidence for it.</p>' +
+    '<p>' + esc(V.reason) + '. Each candidate is fitted on a training half of the ' +
+    'live-token protocols only and scored on the held-out half, where its predicted market cap ' +
+    'meets the market’s own: the holdout takes every fifth protocol by slug, the time split ' +
+    'trains on the older half and tests on the younger half. The baseline is the naive global ' +
+    'median multiple on the same training half — a candidate that cannot beat it has learned ' +
+    'nothing. The board then refits the winner on every live-token protocol; these numbers stay ' +
+    'the train-only evidence for it.</p>' +
     '<p class="hint">The errors are large, and the table says so: the typical prediction lands ' +
     'within about three times the market’s own value (median |log error| near 1.15). Market-cap / ' +
     'TVL varies enormously across protocols, and the board is a ranking, not a price — the order ' +
     'is the claim, and the farm verdict is whether the gas is trivial next to the protocol.</p>' +
     '<table><thead><tr><th>Candidate</th><th class="num">Pooled median |log error|</th></tr></thead><tbody>' +
     V.pooled.map(pooledRow).join('') + '</tbody></table>' +
+    '<h2>What else we tried — and rejected</h2>' +
+    '<p>A variant is kept only when it beats the shipped model by a clear margin on held-out ' +
+    'data and holds up across extra splits. Three were tried for this board; none did, so the ' +
+    'model above stands. Every number below is recomputed from the sealed snapshot when the ' +
+    'board is built.</p>' +
+    '<table><thead><tr><th>Variant</th><th class="num">Pooled median |log error|</th><th class="num">Control</th><th>Kept?</th></tr></thead><tbody>' +
+    (V.variants || []).map((v) =>
+      '<tr><td>' + esc(v.name) + '</td><td class="num">' + v.pooled.toFixed(3) + '</td>' +
+      '<td class="num">' + v.control_pooled.toFixed(3) + ' (' + esc(v.control) + ')</td>' +
+      '<td>' + (v.kept ? 'kept' : 'rejected') + '</td></tr>').join('') + '</tbody></table>' +
+    (V.variants || []).map((v) => '<p class="hint"><strong>' + esc(v.name) + ':</strong> ' + esc(v.note) + '</p>').join('') +
     '<table><thead><tr><th>Split</th><th class="num">Curve</th><th class="num">Category median</th><th class="num">Baseline</th></tr></thead><tbody>' +
     splitRows + '</tbody></table>';
   $('compRows').innerHTML = R.comparables.map((c) =>

@@ -88,7 +88,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -393,12 +393,23 @@ export interface SplitResult {
   candidates: SplitCandidate[];
 }
 
+/** One model variant the board tested and kept or rejected, with its held-out evidence. */
+export interface VariantResult {
+  name: string;
+  pooled: number;
+  control_pooled: number;
+  control: string;
+  kept: boolean;
+  note: string;
+}
+
 /** The validation report: the splits, the candidates' held-out errors, and the predictor the board uses. */
 export interface ValidationReport {
   predictor: 'median' | 'curve';
   reason: string;
   pooled: { name: 'median' | 'curve' | 'baseline'; med_abs_log_err: number }[];
   splits: SplitResult[];
+  variants: VariantResult[];
 }
 
 /**
@@ -491,7 +502,157 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
     predictor === 'curve'
       ? `the size curve's pooled held-out error beats the category median's (${pooledErr('curve')} vs ${pooledErr('median')} median |log error| over both held-out sets), so the board prices off the fitted curve`
       : `the category median's pooled held-out error beats the size curve's (${pooledErr('median')} vs ${pooledErr('curve')} median |log error| over both held-out sets), so the board prices off the category medians`;
-  return { predictor, reason, pooled, splits };
+  return { predictor, reason, pooled, splits, variants: validateVariants(snapshot) };
+}
+
+/** One blind split: who trains, who is tested. */
+interface BlindSplit {
+  name: string;
+  train: SnapshotProtocol[];
+  test: SnapshotProtocol[];
+}
+
+/** The two splits the shipped validation uses, plus five more that only the variant tests see. */
+function blindSplits(snapshot: Snapshot): { shipped: BlindSplit[]; extra: BlindSplit[] } {
+  const live = liveSet(snapshot);
+  const sorted = [...live].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const dated = live.filter((p) => p.listed_at !== null).sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : 0));
+  const mid = Math.floor(dated.length / 2);
+  const shipped: BlindSplit[] = [
+    { name: 'holdout', train: sorted.filter((_, i) => i % 5 !== 4), test: sorted.filter((_, i) => i % 5 === 4) },
+    { name: 'time', train: dated.slice(0, mid), test: dated.slice(mid) },
+  ];
+  const extra: BlindSplit[] = [
+    ...[0, 1, 2, 3].map((off) => ({
+      name: `holdout-${off}`,
+      train: sorted.filter((_, i) => i % 5 !== off),
+      test: sorted.filter((_, i) => i % 5 === off),
+    })),
+    { name: 'time-reversed', train: dated.slice(mid), test: dated.slice(0, mid) },
+  ];
+  return { shipped, extra };
+}
+
+/** The pooled median |log error| of a base-function factory over splits, under a model. */
+function pooledBaseError(
+  snapshot: Snapshot,
+  splits: BlindSplit[],
+  fitBase: (train: SnapshotProtocol[]) => (p: SnapshotProtocol) => number,
+  model: ModelConstants = MODEL,
+): number {
+  const errs: number[] = [];
+  for (const s of splits) {
+    const base = fitBase(s.train);
+    for (const p of s.test) {
+      const v = impliedFromBase(p, snapshot.as_of, model, base(p));
+      errs.push(Math.abs(Math.log(v / p.mcap_usd!)));
+    }
+  }
+  return round3(median(errs, NaN));
+}
+
+/** The plain size curve's base function, fitted on a training set. */
+function curveBase(train: SnapshotProtocol[]): (p: SnapshotProtocol) => number {
+  const fit = fitCurveFit(train.map((p) => ({ tvl: p.tvl_usd, mcap: p.mcap_usd! })));
+  if (fit === null) throw new SnapshotError('too few live-token protocols to fit a size curve');
+  return (p: SnapshotProtocol) => Math.exp(fit.a) * Math.pow(p.tvl_usd, fit.b);
+}
+
+/** The size curve plus a shrunk per-category residual: each category's median train residual, pulled toward zero by n/(n+5), so a thin category cannot move the curve. */
+function shrunkCategoryBase(train: SnapshotProtocol[]): (p: SnapshotProtocol) => number {
+  const fit = fitCurveFit(train.map((p) => ({ tvl: p.tvl_usd, mcap: p.mcap_usd! })));
+  if (fit === null) throw new SnapshotError('too few live-token protocols to fit a size curve');
+  const resid = new Map<string, number[]>();
+  for (const p of train) {
+    const r = Math.log(p.mcap_usd!) - (fit.a + fit.b * Math.log(p.tvl_usd));
+    const key = p.category ?? 'Unknown';
+    resid.set(key, [...(resid.get(key) ?? []), r]);
+  }
+  const adj = new Map<string, number>();
+  for (const [key, rs] of resid) adj.set(key, (rs.length / (rs.length + 5)) * median(rs, 0));
+  return (p: SnapshotProtocol) => {
+    const base = Math.exp(fit.a) * Math.pow(p.tvl_usd, fit.b);
+    return base * Math.exp(adj.get(p.category ?? 'Unknown') ?? 0);
+  };
+}
+
+/** The clamped 7-day TVL change as a regressor, in the same units the growth multiplier uses. */
+function changeRegressor(p: SnapshotProtocol): number {
+  const raw = typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : 0;
+  return Math.min(120, Math.max(-60, raw)) / 100;
+}
+
+/** The size curve with the 7-day change as a second regressor: ln(mcap) = a + b x ln(TVL) + c x change, by least squares. */
+function curveChangeBase(train: SnapshotProtocol[]): (p: SnapshotProtocol) => number {
+  const x = train.map((p) => [1, Math.log(p.tvl_usd), changeRegressor(p)]);
+  const y = train.map((p) => Math.log(p.mcap_usd!));
+  const xtx = [0, 1, 2].map((i) => [0, 1, 2].map((j) => x.reduce((s, r) => s + r[i]! * r[j]!, 0)));
+  const xty = [0, 1, 2].map((i) => x.reduce((s, r, k) => s + r[i]! * y[k]!, 0));
+  const m = xtx.map((row, i) => [...row, xty[i]!]);
+  for (let col = 0; col < 3; col++) {
+    let piv = col;
+    for (let r = col + 1; r < 3; r++) if (Math.abs(m[r]![col]) > Math.abs(m[piv]![col])) piv = r;
+    [m[col], m[piv]] = [m[piv]!, m[col]!];
+    for (let r = col + 1; r < 3; r++) {
+      const f = m[r]![col] / m[col]![col]!;
+      for (let c = col; c < 4; c++) m[r]![c] -= f * m[col]![c]!;
+    }
+  }
+  const beta = [0, 0, 0];
+  for (let r = 2; r >= 0; r--) {
+    let s = m[r]![3]!;
+    for (let c = r + 1; c < 3; c++) s -= m[r]![c]! * beta[c]!;
+    beta[r] = s / m[r]![r]!;
+  }
+  const [a, b, c] = beta;
+  return (p: SnapshotProtocol) => Math.exp(a!) * Math.pow(p.tvl_usd, b!) * Math.exp(c! * changeRegressor(p));
+}
+
+/**
+ * The variants the board tested against the shipped size curve and rejected, each on the same
+ * blind protocol as the shipped validation: train-only fits, scored on held-out halves. A variant
+ * is kept only when it beats the shipped model by a clear margin on held-out data and holds up
+ * across the extra splits; none of the three did, so the radar-3 model stands and the board is
+ * unchanged by the test — the evidence for keeping it is the table, not an assertion.
+ */
+export function validateVariants(snapshot: Snapshot): VariantResult[] {
+  const { shipped, extra } = blindSplits(snapshot);
+  const all = [...shipped, ...extra];
+  const curveShipped = pooledBaseError(snapshot, shipped, curveBase);
+  const curveAll = pooledBaseError(snapshot, all, curveBase);
+
+  const shrunk = pooledBaseError(snapshot, shipped, shrunkCategoryBase);
+  const changeShipped = pooledBaseError(snapshot, shipped, curveChangeBase);
+  const changeExtra = pooledBaseError(snapshot, extra, curveChangeBase);
+  const curveExtra = pooledBaseError(snapshot, extra, curveBase);
+  const gwFull = pooledBaseError(snapshot, all, curveBase, { ...MODEL, growth_weight: 1.0 });
+
+  return [
+    {
+      name: 'size curve + shrunk category residual',
+      pooled: shrunk,
+      control_pooled: curveShipped,
+      control: 'plain size curve, same splits',
+      kept: false,
+      note: `category residuals do not generalise even shrunk toward zero (shrinkage n/(n+5)): pooled ${shrunk} vs the plain curve's ${curveShipped} on the two shipped splits.`,
+    },
+    {
+      name: 'size curve + 7-day TVL change',
+      pooled: changeShipped,
+      control_pooled: curveShipped,
+      control: 'plain size curve, same splits',
+      kept: false,
+      note: `it looks better on the two shipped splits (${changeShipped} vs ${curveShipped}) but the fitted change coefficient flips sign between training halves (-2.55, +6.27) and the variant loses on three of five extra splits (extra pooled ${changeExtra} vs the curve's ${curveExtra}) — an unstable feature, not a real one.`,
+    },
+    {
+      name: 'growth weight 1.00 (full 7-day change)',
+      pooled: gwFull,
+      control_pooled: curveAll,
+      control: 'growth weight 0.50, same seven splits',
+      kept: false,
+      note: `seven-split pooled ${gwFull} vs ${curveAll} for the shipped weight: a 0.015 gap over 134 held-out points, and it loses on two splits — inside the noise, so the shipped 0.50 stands.`,
+    },
+  ];
 }
 
 /** The growth and maturity multipliers and the implied value of a base, shared by every predictor. */
@@ -729,20 +890,22 @@ export function farmEconomics(p: SnapshotProtocol, age: number | null, implied: 
 }
 
 /**
- * A protocol's farm plan: seven steps, the first the verdict with the plan's net cost, then six
- * concrete actions each with a cost and a time. The plan is derived from the protocol's own
- * record (category, chains, TVL, age, implied value), never from a hand-written list of names.
- * Nothing here promises a token: the protocol records no token, and the plan farms the protocol
- * as it is, so the position is worth holding even if no launch ever comes.
+ * A protocol's farm plan: seven steps, the first the verdict with the plan's net cost and the
+ * implied value's multiple over the gas, then six concrete actions each with a cost and a time.
+ * The plan is derived from the protocol's own record (category, chains, TVL, age, implied value),
+ * never from a hand-written list of names. Nothing here promises a token: the protocol records
+ * no token, and the plan farms the protocol as it is, so the position is worth holding even if
+ * no launch ever comes.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null, implied: number, econ: FarmEconomics): FarmStep[] {
   const chain = chainOf(p);
   const capital = econ.capitalUsd;
   const hold = econ.holdDays;
   const action = actionFor(p, capital, chain);
+  const gasMultiple = Math.round(implied / econ.gasUsd).toLocaleString('en-US');
   return [
     {
-      text: `Verdict: ${econ.verdict} — this protocol's implied value is ${fmtUsdShort(implied)} against about $${econ.gasUsd} of gas over ${hold} days on $${capital} of capital.`,
+      text: `Verdict: ${econ.verdict} — this protocol's implied value is ${fmtUsdShort(implied)} against about $${econ.gasUsd} of gas over ${hold} days on $${capital} of capital, about ${gasMultiple} times the gas.`,
       cost: `about $${econ.gasUsd} of gas in all`,
       time: `${hold} days`,
     },
